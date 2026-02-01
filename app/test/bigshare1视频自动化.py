@@ -613,26 +613,29 @@ class RuyiInstance:
     def check_play_status(self, node_id):
         """主动查询视频状态: PAUSED, BUFFERING, PLAYING"""
         try:
+            # 1. 解析 Node
             res = self.send_cdp("DOM.resolveNode", {"nodeId": node_id})
             if 'error' in res or 'object' not in res.get('result', {}):
                 return "UNKNOWN"
 
             object_id = res['result']['object']['objectId']
 
+            # 2. JS 查询
             js_res = self.send_cdp("Runtime.callFunctionOn", {
                 "objectId": object_id,
                 "functionDeclaration": """
-                    function() {
+                    function() { 
                         return {
                             readyState: this.readyState,
                             paused: this.paused,
                             currentTime: this.currentTime
-                        };
+                        }; 
                     }
                 """,
                 "returnByValue": True
             })
 
+            # 3. 释放
             self.send_cdp("Runtime.releaseObject", {"objectId": object_id})
 
             val = js_res.get('result', {}).get('result', {}).get('value', {})
@@ -645,6 +648,7 @@ class RuyiInstance:
             if paused:
                 return "PAUSED"
 
+            # Paused=False 且 RS < 3 -> 缓冲中
             if rs < 3:
                 return "BUFFERING"
 
@@ -707,9 +711,242 @@ def simulate_human_move(inst, start_x, start_y, end_x, end_y, steps=25):
         time.sleep(random.uniform(0.01, 0.03))
 
 
-def automation_task(inst, win_x, win_y, win_w, win_h, play_duration_range=(50, 50), round_budget_seconds=140):
-    """自动化任务流程 - 基于 CDP 的严格播放检测与累计计时"""
-    print(f"🚀 [Win {inst.index}] 开始任务...")
+def automation_task(inst, win_x, win_y, win_w, win_h, play_duration_range=(60, 70)):
+    """单个窗口的自动化任务流程"""
+    print(f"🚀 [Win {inst.index}] 开始任务 (API Mode)...")
+
+    if not inst.connect():
+        print(f"❌ [Win {inst.index}] 连接失败")
+        return
+
+    # 1. 布局窗口
+    inst.set_bounds(win_x, win_y, win_w, win_h)
+
+    # 2. 访问目标视频页
+    # target_url = 'https://abmxy.easyvidplayer.com/#pruqs'
+    target_url = 'https://videy.tv/s/yz79sidc'
+    # target_url = 'https://vinovo.to/d/5q71nxk3agoj89'
+    referrer_url = 'https://blog-five-lime-46.vercel.app/'
+
+    # target_url = 'https://mmxxyy.vidplayer.live/#wvrm5'
+    # target_url = 'https://up4fun.top/u42bcf4g3hlm.html'
+    # target_url = 'https://vinovo.to/d/9qo4rnd2an26w0'
+    # target_url = 'https://abstream.to/zogxzwbyj7x1'
+    inst.send_cdp('Page.navigate', {'url': target_url, 'referrer': referrer_url})
+    print(f"[Win {inst.index}] 正在加载页面 (Referer: {referrer_url})...")
+
+    # 等待初始加载
+    inst.wait_and_process(5)
+
+    print(f"[Win {inst.index}] 进入 API 自动化循环 (等待播放，无超时)...")
+
+    # 循环直到检测到播放
+    while not inst.media_playing and inst.running:
+        try:
+            # --- 0. 窗口维护: 聚焦主页 & 关闭广告 ---
+            inst.maintain_focus()
+
+            # --- 1. 使用 Media API 检查状态 ---
+            if inst.media_playing:
+                break
+
+            # --- 2. 使用 DOM API 寻找元素 (No JS) ---
+            # 递归遍历 DOM 树查找 video 节点 ID (纯 Python 递归查找)
+            video_node_id = inst.find_video_via_api()
+
+            target_box = None
+            if video_node_id:
+                # 获取元素布局位置
+                box_res = inst.send_cdp("DOM.getBoxModel", {"nodeId": video_node_id})
+                if 'result' in box_res:
+                    model = box_res['result']['model']
+                    if model['width'] > 0 and model['height'] > 0:
+                        # 找到有效可见的 video
+                        content = model['content']  # [x1,y1, x2,y2, x3,y3, x4,y4]
+                        target_box = {
+                            'x': content[0],
+                            'y': content[1],
+                            'width': model['width'],
+                            'height': model['height']
+                        }
+                        print(f"[Win {inst.index}] API 找到 Video 元素 (已加载): NodeId={video_node_id}")
+
+            # --- 3. 执行点击 (仅当找到视频元素时) ---
+            if target_box:
+                # [状态检查]
+                # 获取准确的播放状态: PAUSED, BUFFERING, PLAYING
+                play_status = inst.check_play_status(video_node_id)
+
+                if play_status == "PLAYING":
+                    print(f"[Win {inst.index}] ✅ 检测到视频已在播放 (RS>=3)，任务完成")
+                    inst.media_playing = True
+                    break
+
+                if play_status == "BUFFERING":
+                    print(f"[Win {inst.index}] ⏳ 视频正在缓冲/加载中... 暂停操作")
+                    inst.wait_and_process(1)
+                    continue
+
+                # 只有状态为 PAUSED 时才点击
+                print(f"[Win {inst.index}] ▶️ 视频处于暂停状态，准备点击...")
+
+                cx = target_box['x'] + target_box['width'] / 2
+                cy = target_box['y'] + target_box['height'] / 2
+
+                print(f"[Win {inst.index}] -> 点击视频 ({int(cx)}, {int(cy)})")
+
+                simulate_human_move(inst, random.randint(10, 200), random.randint(10, 200), cx, cy, steps=3)
+
+                inst.send_cdp("Input.dispatchMouseEvent",
+                              {"type": "mousePressed", "x": cx, "y": cy, "button": "left", "clickCount": 1})
+                time.sleep(0.05)
+                inst.send_cdp("Input.dispatchMouseEvent",
+                              {"type": "mouseReleased", "x": cx, "y": cy, "button": "left", "clickCount": 1})
+
+                # 点击后等待一段时间，给播放器反应时间
+                inst.wait_and_process(5)
+            else:
+                print(f"[Win {inst.index}] 等待视频元素加载...")
+                inst.wait_and_process(2)
+
+        except Exception as e:
+            print(f"[Win {inst.index}] 异常: {e}")
+            time.sleep(1)
+
+    # 播放开始后
+    print(f"✅ [Win {inst.index}] 视频确认正在播放! 开始计时观看...")
+    min_d, max_d = play_duration_range
+    print(f"🎉 [Win {inst.index}] 保持观看 {min_d}-{max_d} 秒...")
+    inst.wait_and_process(random.randint(min_d, max_d))
+    print(f"[Win {inst.index}] 观看结束。")
+
+    # 重置页面，模拟关闭效果
+    inst.send_cdp('Page.navigate', {'url': 'about:blank'})
+
+
+def automation_task_vinovo(inst, win_x, win_y, win_w, win_h, play_duration_range=(90, 100)):
+    """Vinovo 任务流程 (优化版)"""
+    print(f"🚀 [Win {inst.index}] 开始 Vinovo 任务 (Target: 5q71nxk3agoj89)...")
+
+    if not inst.connect():
+        print(f"❌ [Win {inst.index}] 连接失败")
+        return
+
+    # 1. 布局窗口
+    inst.set_bounds(win_x, win_y, win_w, win_h)
+
+    # 2. 访问目标视频页
+    target_url = 'https://vinovo.to/d/5q71nxk3agoj89'
+    print(f"[Win {inst.index}] 正在访问: {target_url}")
+    inst.send_cdp('Page.navigate', {'url': target_url})
+    print(f"[Win {inst.index}] 正在加载页面...")
+
+    # 等待初始加载
+    inst.wait_and_process(5)
+
+    print(f"[Win {inst.index}] 进入 Vinovo 自动化循环 (智能检测)...")
+
+    buffering_start_time = 0
+
+    # 循环直到检测到播放
+    while not inst.media_playing and inst.running:
+        try:
+            # --- 0. 窗口维护: 聚焦主页 & 关闭广告 ---
+            inst.maintain_focus()
+
+            # --- 1. 使用 Media API 检查状态 ---
+            if inst.media_playing:
+                break
+
+            # --- 2. 使用 DOM API 寻找元素 (No JS) ---
+            video_node_id = inst.find_video_via_api()
+
+            target_box = None
+            if video_node_id:
+                box_res = inst.send_cdp("DOM.getBoxModel", {"nodeId": video_node_id})
+                if 'result' in box_res:
+                    model = box_res['result']['model']
+                    if model['width'] > 0 and model['height'] > 0:
+                        content = model['content']
+                        target_box = {
+                            'x': content[0],
+                            'y': content[1],
+                            'width': model['width'],
+                            'height': model['height']
+                        }
+                        # print(f"[Win {inst.index}] API 找到 Video 元素: NodeId={video_node_id}")
+
+            # --- 3. 执行逻辑 (仅当找到视频元素时) ---
+            if target_box:
+                # [状态检查]
+                play_status = inst.check_play_status(video_node_id)
+
+                # 情况A: JS显示正在播放 (但CDP可能还没捕获到)
+                if play_status == "PLAYING":
+                    print(f"[Win {inst.index}] JS状态为 PLAYING, 等待 CDP 事件确认...")
+                    buffering_start_time = 0
+                    inst.wait_and_process(2)
+                    continue
+
+                # 情况B: 缓冲中 (可能卡住)
+                if play_status == "BUFFERING":
+                    if buffering_start_time == 0:
+                        buffering_start_time = time.time()
+
+                    elapsed = time.time() - buffering_start_time
+                    if elapsed > 10:
+                        print(f"[Win {inst.index}] ⚠️ 视频缓冲超时 ({int(elapsed)}s)，尝试点击唤醒...")
+                        buffering_start_time = 0  # 重置
+                        # 强制点击逻辑，流向下方点击代码
+                    else:
+                        print(f"[Win {inst.index}] ⏳ 视频正在缓冲 ({int(elapsed)}s)...")
+                        inst.wait_and_process(1)
+                        continue
+                else:
+                    buffering_start_time = 0
+
+                # 情况C: 暂停 或 缓冲超时 -> 点击
+                print(f"[Win {inst.index}] ▶️ 准备点击视频 (Status={play_status})...")
+
+                cx = target_box['x'] + target_box['width'] / 2
+                cy = target_box['y'] + target_box['height'] / 2
+
+                simulate_human_move(inst, random.randint(10, 200), random.randint(10, 200), cx, cy, steps=3)
+
+                inst.send_cdp("Input.dispatchMouseEvent",
+                              {"type": "mousePressed", "x": cx, "y": cy, "button": "left", "clickCount": 1})
+                time.sleep(0.05)
+                inst.send_cdp("Input.dispatchMouseEvent",
+                              {"type": "mouseReleased", "x": cx, "y": cy, "button": "left", "clickCount": 1})
+
+                # 点击后等待，给播放器反应时间
+                inst.wait_and_process(3)
+
+            else:
+                print(f"[Win {inst.index}] 未找到视频元素，等待加载...")
+                inst.wait_and_process(2)
+
+        except Exception as e:
+            print(f"[Win {inst.index}] 异常: {e}")
+            time.sleep(1)
+
+    # 播放开始后
+    if inst.media_playing:
+        print(f"✅ [Win {inst.index}] 视频确认正在播放! 开始计时观看...")
+        min_d, max_d = play_duration_range
+        print(f"🎉 [Win {inst.index}] 保持观看 {min_d}-{max_d} 秒...")
+        inst.wait_and_process(random.randint(min_d, max_d))
+        print(f"[Win {inst.index}] 观看结束。")
+        return True
+
+    # 重置页面
+    inst.send_cdp('Page.navigate', {'url': 'about:blank'})
+    return False
+
+
+def automation_task_bigshare(inst, win_x, win_y, win_w, win_h, play_duration_range=(30, 30), round_budget_seconds=180):
+    """BigShare 任务流程 - 基于 CDP 的严格播放检测与累计计时"""
+    print(f"🚀 [Win {inst.index}] 开始 BigShare 任务 (Target: 40289/e)...")
 
     if not inst.connect():
         print(f"❌ [Win {inst.index}] CDP 连接失败")
@@ -717,12 +954,13 @@ def automation_task(inst, win_x, win_y, win_w, win_h, play_duration_range=(50, 5
 
     inst.set_bounds(win_x, win_y, win_w, win_h)
 
-    target_urls = ['https://videy.tv/s/QNekNQ8O',
-                   'https://videy.tv/s/sZc3z9hp',
-                   'https://videy.tv/s/NSUmt8nF',
-                   'https://videy.tv/s/jqlMyN24',
-                   'https://videy.tv/s/ZcEd7Icp',
-                   'https://videy.tv/s/yz79sidc']
+    # target_url = 'https://bigshare.io/watch/40289/e',
+    target_urls = ['https://bigshare.io/watch/41830/e',
+                   'https://bigshare.io/watch/41829/e',
+                   'https://bigshare.io/watch/41828/e',
+                   'https://bigshare.io/watch/41827/e',
+                   'https://bigshare.io/watch/40293/e',
+                   'https://bigshare.io/watch/40289/e']
     target_url = random.choice(target_urls)
     referrer_url = 'https://blog-five-lime-46.vercel.app/'
     print(f"[Win {inst.index}] 正在访问视频页: {target_url}")
@@ -743,7 +981,7 @@ def automation_task(inst, win_x, win_y, win_w, win_h, play_duration_range=(50, 5
 
             q_res = inst.send_cdp("DOM.querySelector", {
                 "nodeId": root_id,
-                "selector": ".xgplayer-play"
+                "selector": ".art-control.art-control-playAndPause"
             })
             node_id = q_res.get('result', {}).get('nodeId')
             if not node_id or node_id <= 0:
@@ -754,55 +992,33 @@ def automation_task(inst, win_x, win_y, win_w, win_h, play_duration_range=(50, 5
                 return None, None
 
             play_html = html_res['result']['outerHTML']
-            print(play_html)
-            pattern = r'<div[^>]*class="[^"]*\bxg-tips\b[^"]*"[^>]*>(.*?)</div>'
+            pattern = r'style="[^"]*(display\s*:\s*[^;"]+;)"\s*><svg\s+xmlns'
             match = re.search(pattern, play_html)
 
             if not match:
                 return None, node_id
 
-            is_play = True if match.group(1) != "Play" else False
+            is_play = True if match.group(1) == "display: none;" else False
             return is_play, node_id
         except Exception as e:
             return None, None
 
-    def click_play_button(node_id=None):
-        """直接点击视频区域 - 查找 video 元素并点击中心位置"""
+    def click_play_button(node_id):
+        """点击播放按钮"""
         try:
-            print(f"[Win {inst.index}] 🎯 正在查找视频元素...")
-            
-            # 查找 video 元素
-            video_node_id = inst.find_video_via_api()
-            
-            if not video_node_id or video_node_id <= 0:
-                print(f"[Win {inst.index}] ❌ 未找到视频元素")
-                return False
-
-            print(f"[Win {inst.index}] ✅ 找到视频元素 NodeId={video_node_id}")
-            
-            # 获取视频元素的位置
-            box_res = inst.send_cdp("DOM.getBoxModel", {"nodeId": video_node_id})
-            
-            if 'result' not in box_res or 'model' not in box_res.get('result', {}):
-                print(f"[Win {inst.index}] ❌ 无法获取视频元素位置")
+            box_res = inst.send_cdp("DOM.getBoxModel", {"nodeId": node_id})
+            if 'result' not in box_res:
                 return False
 
             model = box_res['result']['model']
-            
             if model['width'] <= 0 or model['height'] <= 0:
-                print(f"[Win {inst.index}] ❌ 视频元素不可见 (width={model['width']}, height={model['height']})")
                 return False
 
-            # 计算视频中心点
             content = model['content']
-            cx = (content[0] + content[2] + content[4] + content[6]) / 4
-            cy = (content[1] + content[3] + content[5] + content[7]) / 4
+            cx = content[0] + model['width'] / 2
+            cy = content[1] + model['height'] / 2
 
-            print(f"[Win {inst.index}] 📍 视频位置: ({int(cx)}, {int(cy)}), 尺寸: {int(model['width'])}x{int(model['height'])}")
-
-            # 模拟人类移动并点击视频中心
             simulate_human_move(inst, random.randint(10, 200), random.randint(10, 200), cx, cy, steps=5)
-            
             inst.send_cdp("Input.dispatchMouseEvent", {
                 "type": "mousePressed", "x": cx, "y": cy, "button": "left", "clickCount": 1
             })
@@ -810,14 +1026,10 @@ def automation_task(inst, win_x, win_y, win_w, win_h, play_duration_range=(50, 5
             inst.send_cdp("Input.dispatchMouseEvent", {
                 "type": "mouseReleased", "x": cx, "y": cy, "button": "left", "clickCount": 1
             })
-            
-            print(f"[Win {inst.index}] ✅ 已点击视频区域")
+            print(f"[Win {inst.index}] ▶️ 已点击播放按钮")
             return True
-            
         except Exception as e:
-            print(f"[Win {inst.index}] ❌ 点击视频异常: {e}")
-            import traceback
-            traceback.print_exc()
+            print(f"[Win {inst.index}] 点击播放按钮异常: {e}")
             return False
 
     task_start = time.time()
@@ -908,8 +1120,8 @@ def main():
     NUM_INSTANCES = 4
     LOCAL_PROXY_START = 10005  # 对应代理脚本的起始端口 (10005-10008)
 
-    PLAY_DURATION_RANGE = (80, 80)
-    ROUND_BUDGET_SECONDS = 170
+    PLAY_DURATION_RANGE = (50, 50)
+    ROUND_BUDGET_SECONDS = 140
     RESTART_COOLDOWN_SECONDS = 5
 
     WORK_WIDTH, WORK_HEIGHT = get_work_area()
@@ -920,17 +1132,18 @@ def main():
     # 1. 初始化实例对象
     print("正在初始化实例对象...")
     for i in range(NUM_INSTANCES):
+        # 为每个窗口分配 调试端口(9222+i) 和 代理端口(10005+i)
         inst = RuyiInstance(i, 9222 + i, LOCAL_PROXY_START + i, DATA_DIR, CHROME_BIN, FP_PATH)
         instances.append(inst)
 
     def worker_loop(inst, wx, wy, ww, wh):
         while True:
             try:
-                print(f"[Win {inst.index}] 启动浏览器...")
+                print(f"\n[{time.strftime('%H:%M:%S')}] [Win {inst.index}] 启动浏览器进程...")
                 inst.launch()
                 time.sleep(5)
-                ok = automation_task(inst, wx, wy, ww, wh, PLAY_DURATION_RANGE,
-                                     round_budget_seconds=ROUND_BUDGET_SECONDS)
+                ok = automation_task_bigshare(inst, wx, wy, ww, wh, PLAY_DURATION_RANGE,
+                                              round_budget_seconds=ROUND_BUDGET_SECONDS)
             except Exception as e:
                 print(f"[Win {inst.index}] 线程异常: {e}")
                 ok = False
@@ -938,18 +1151,16 @@ def main():
                 inst.close()
 
             if not ok:
-                print(f"[Win {inst.index}] 任务未完成，等待 {RESTART_COOLDOWN_SECONDS} 秒后重启...")
+                print(f"[Win {inst.index}] 未完成播放，等待 {RESTART_COOLDOWN_SECONDS}s 后重启...")
                 time.sleep(RESTART_COOLDOWN_SECONDS)
-            else:
-                print(f"[Win {inst.index}] 任务完成，立即重启下一轮...")
 
     threads = []
     for i, inst in enumerate(instances):
         wx = (i % COLS) * win_w
         wy = (i // COLS) * win_h
         t = threading.Thread(target=worker_loop, args=(inst, wx, wy, win_w, win_h), daemon=True)
-        t.start()
         threads.append(t)
+        t.start()
 
     for t in threads:
         t.join()
